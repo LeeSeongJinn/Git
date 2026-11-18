@@ -1,0 +1,15 @@
+# 지금 사용하는 파일만 올림 (나머지는 무시)
+/*
+!/.gitignore
+!/package.xml
+!/setup.py
+!/setup.cfg
+!/resource/
+!/config/
+!/my_package/
+/my_package/*
+!/my_package/__init__.py
+!/my_package/worker_detect_node.py
+!/my_package/worker_follow_node.py
+!/my_package/web_relay_node.py
+__pycache__/
