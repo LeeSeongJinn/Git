@@ -41,12 +41,22 @@
   ros2 run my_package worker_follow 2 --ros-args -p target_distance:=1.0
   # 웹 없이 단독 테스트 (worker_detect --no-web 과 함께):
   ros2 run my_package worker_follow 1 --ros-args -p require_web_confirm:=false -p auto_undock:=true
+
+터틀봇 추종 모드 (robot): B로봇 호출로 A 앞에 도착한 로봇 B 가 로봇 A 를 따라감
+  인식: ros2 run my_package worker_detect tb      (B 의 OAK-D 로 A 인식 → /<B>/tb_detect/target)
+  추종: ros2 run my_package worker_follow robot all
+  - 호출 결과(web_feedback ok)가 오면 시작, A 의 작업 종료·인식 취소·구역 이동·도킹 또는
+    B 에 다른 이동/도킹/언독 명령이 오면 멈춤 (RobotFollower 클래스 설명 참고)
+  - 노드 이름 robot_follow_<로봇>, 정지 기록 ~/follow_stop_log_<로봇>_robot.csv
 """
 
 import math
 import os
 import sys
 import time
+import csv
+import json
+import datetime
 from collections import deque
 from typing import Dict, Optional, Tuple
 
@@ -70,7 +80,8 @@ from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
 from irobot_create_msgs.action import Undock
 from irobot_create_msgs.msg import DockStatus
 from nav2_msgs.action import NavigateToPose
-from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import CameraInfo, LaserScan
 from std_msgs.msg import Bool, String
 from std_msgs.msg import Float32MultiArray
 from tf2_msgs.msg import TFMessage
@@ -123,12 +134,15 @@ def wrap_angle(a: float) -> float:
 
 
 class WorkerFollower(Node):
-    def __init__(self, robot_ns: str = 'robot6', default_auto_undock: bool = False):
+    def __init__(self, robot_ns: str = 'robot6', default_auto_undock: bool = False,
+                 node_prefix: str = 'worker_follow', param_defaults: Optional[Dict] = None):
         ns = robot_ns.strip('/')
-        super().__init__(f'worker_follow_{ns}')
+        super().__init__(f'{node_prefix}_{ns}')
         self.robot_ns = ns
 
-        dp = self.declare_parameter
+        # param_defaults: 기본값만 바꿈 (터틀봇 추종용). --ros-args -p 로 준 값이 항상 우선.
+        defaults = param_defaults or {}
+        dp = lambda name, value: self.declare_parameter(name, defaults.get(name, value))  # noqa: E731
         # Topics / frames
         dp('scan_topic', f'/{ns}/scan')
         dp('tf_topic', f'/{ns}/tf')
@@ -148,16 +162,20 @@ class WorkerFollower(Node):
         dp('register_reply_topic', f'/{ns}/user_register/reply')
         dp('register_retry_topic', f'/{ns}/user_register/retry')
         dp('register_cancel_topic', f'/{ns}/user_register/cancel')
+        # 작업자 소실 복구: 이 시간 이상 못 보면 마지막 좌표로 이동 → 천천히 한 바퀴 → 못 찾으면 일시정지
+        dp('lost_recovery_enabled', True)
+        dp('lost_recovery_after_sec', 5.0)
+        dp('lost_spin_speed', 0.3)           # rad/s (한 바퀴 약 21초)
+        dp('lost_move_timeout', 40.0)        # 마지막 좌표 이동 최대 시간 (초)
         dp('pause_topic', f'/{ns}/pause')
 
         # Webcam geometry (웹캠이 로봇 위에 정면으로 달려 있다고 가정)
-        dp('camera_hfov_deg', 60.0)          # 웹캠 가로 화각 (실측 권장)
+        dp('camera_hfov_deg', 50.0)          # 웹캠 가로 화각 (50도로 변경)
         dp('camera_yaw_offset_deg', 0.0)     # 웹캠이 로봇 정면에서 돌아간 각도 (왼쪽 +)
         dp('camera_x_offset', 0.0)           # base_link 기준 웹캠 위치 (m)
         dp('camera_y_offset', 0.0)
         dp('camera_mirrored', False)         # 좌우 반전 영상이면 true
         dp('image_width', 640)               # 메시지에 영상폭이 없을 때만 사용
-        dp('min_match_score', 0.6)
         dp('camera_lost_timeout', 1.0)
         dp('camera_assoc_max_age', 0.5)
 
@@ -235,7 +253,6 @@ class WorkerFollower(Node):
         self.cam_xy = (float(g('camera_x_offset')), float(g('camera_y_offset')))
         self.cam_mirrored = bool(g('camera_mirrored'))
         self.image_width_default = int(g('image_width'))
-        self.min_match_score = float(g('min_match_score'))
         self.camera_lost_timeout = float(g('camera_lost_timeout'))
         self.camera_assoc_max_age = float(g('camera_assoc_max_age'))
 
@@ -317,6 +334,16 @@ class WorkerFollower(Node):
         self.create_subscription(Bool, str(g('register_retry_topic')), self.retry_callback, 10)
         self.create_subscription(Bool, str(g('register_cancel_topic')), self.cancel_callback, 10)
         self.create_subscription(Bool, str(g('pause_topic')), self.pause_callback, 10)
+        self.lost_recovery_enabled = bool(g('lost_recovery_enabled'))
+        self.lost_recovery_after = float(g('lost_recovery_after_sec'))
+        self.lost_spin_speed = abs(float(g('lost_spin_speed')))
+        self.lost_move_timeout = float(g('lost_move_timeout'))
+        self.recover = None              # None | {'stage': 'move'|'spin', ...}
+        self.recover_done_for = None     # 이미 복구를 시도한 소실 (last_worker_seen 값)
+        self.last_worker_map = None      # 마지막으로 추종한 작업자 map 좌표 (복구용, 연결 초기화와 별개)
+        self.lost_paused = False         # 한 바퀴 탐색 실패 → 일시정지 (resume / y 로 해제)
+        # 웹·콘솔 '재개'(pause false) 를 직접 받아 탐색 실패 일시정지를 푼다
+        self.create_subscription(String, f'/{ns}/web_command', self.web_command_callback, 10)
         self.nav_client = ActionClient(self, NavigateToPose, self.action_name)
         self.undock_client = ActionClient(self, Undock, self.undock_action)
         self.cmd_pub = self.create_publisher(
@@ -374,6 +401,17 @@ class WorkerFollower(Node):
 
         self.create_timer(0.10, self.control_loop)
 
+        # ---- 정지 원인 기록: odom 으로 '실제로 움직이다 멈춘 순간'을 잡아 그때의 원인을 남긴다 ----
+        self.stop_cause = ('시작 대기', '')          # (분류, 상세) — control_loop 가 매 주기 갱신
+        self.stop_snapshot = None                    # 감속 시작 시점의 원인 (정지 확정 때 기록)
+        self.motion_state = 'stopped'
+        self.moving_since = self.quiet_since = self.motion_started = None
+        self.stop_events = []
+        self.stop_log_path = os.path.expanduser(f'~/follow_stop_log_{ns}.csv')
+        self.create_subscription(Odometry, f'/{ns}/odom', self.odom_stop_callback,
+                                 qos_profile_sensor_data)
+        self.get_logger().info(f'Stop-cause log: {self.stop_log_path}')
+
         log = self.get_logger().info
         log(f'Worker follower for {ns} started.')
         log(f'Worker input: {self.worker_topic} (Float32MultiArray from worker_detect_node)')
@@ -425,6 +463,7 @@ class WorkerFollower(Node):
     def reply_callback(self, msg: String):
         r = msg.data.strip().lower()
         if r == 'y':
+            self.clear_lost_pause("worker confirmed 'y'")
             self.set_web_enabled(True, "worker confirmed 'y'")
         elif r == 'n':
             self.set_web_enabled(False, "worker rejected 'n'")
@@ -441,6 +480,8 @@ class WorkerFollower(Node):
         paused = bool(msg.data)
         if paused != self.paused:
             self.get_logger().info(f'Web: {"PAUSED" if paused else "RESUMED"}')
+            if not paused:
+                self.clear_lost_pause('web resume')
         self.paused = paused
         if paused:
             self.halt()
@@ -466,7 +507,8 @@ class WorkerFollower(Node):
         self.last_cam_msg = now
         found = d[0] >= 0.5
         registered = d[10] >= 0.5 if len(d) >= 11 else True
-        if not (found and registered) or d[5] < self.min_match_score:
+        # 점수 기준(min_match_score)은 사용하지 않음: 같은 사람 판단은 인식 노드(MATCH_THRESHOLD)가 함
+        if not (found and registered):
             return  # not seen in this frame -> self.cam ages out
         cx, cy, w, h = d[1], d[2], d[3], d[4]
         if not all(math.isfinite(v) for v in (cx, cy, w, h)) or not 0.0 <= cx <= 1.0:
@@ -759,6 +801,7 @@ class WorkerFollower(Node):
             vel = ((tx - x0) / (now - t0), (ty - y0) / (now - t0)) \
                 if len(self.target_hist) >= 3 and now - t0 >= 0.3 else (0.0, 0.0)
 
+            self.last_worker_map = self.filtered_target
             self.track = {
                 'map': self.filtered_target,
                 'robot': (rx, ry, ryaw),
@@ -780,9 +823,187 @@ class WorkerFollower(Node):
                                     throttle_duration_sec=2.0)
 
     # ================= Control =================
+    # ================= 정지 원인 기록 =================
+    @staticmethod
+    def classify_block(reason, scan_lost, cam_dead, worker_lost, tf_lost):
+        if reason.startswith('waiting for worker confirmation'):
+            return ('작업자 확인 전 (y 전 / n / 재인식)', reason)
+        if reason.startswith('paused after lost-worker'):
+            return ('대상 소실 - 한 바퀴 탐색 실패 → 일시정지', reason)
+        if reason.startswith('paused'):
+            return ('일시정지 (웹·콘솔 pause/수동조작)', reason)
+        if reason.startswith('robot is docked'):
+            return ('도크 위', reason)
+        if scan_lost or tf_lost:
+            return ('센서·TF 끊김', reason)
+        if cam_dead:
+            return ('카메라 메시지 없음 (인식 노드 끊김)', reason)
+        if worker_lost:
+            return ('대상 소실 - 카메라', '카메라에서 등록 작업자를 못 찾음')
+        return ('기타', reason)
+
+    def odom_stop_callback(self, msg: Odometry):
+        now = time.monotonic()
+        v = msg.twist.twist
+        lin = abs(v.linear.x)
+        if lin > 0.05:                                   # 직진 중 (제자리 회전은 제외)
+            self.quiet_since = None
+            self.stop_snapshot = None
+            if self.moving_since is None:
+                self.moving_since = now
+            if self.motion_state == 'stopped' and now - self.moving_since >= 0.3:
+                self.motion_state, self.motion_started = 'moving', now
+            return
+        self.moving_since = None
+        if lin < 0.02:
+            if self.quiet_since is None:
+                self.quiet_since = now
+                self.stop_snapshot = self.stop_cause      # 감속이 끝난 시점의 원인
+            if self.motion_state == 'moving' and now - self.quiet_since >= 0.5:
+                self.motion_state = 'stopped'
+                self.record_stop(now)
+        elif self.stop_snapshot is None:
+            self.stop_snapshot = self.stop_cause          # 감속 중
+
+    def record_stop(self, now):
+        cat, detail = self.stop_snapshot or self.stop_cause
+        dist = f'{self.track["range"]:.2f}' if self.track is not None else ''
+        cam_age = (f'{now - self.last_worker_seen:.1f}' if self.last_worker_seen is not None else '')
+        moved = f'{(self.quiet_since or now) - (self.motion_started or now):.1f}'
+        row = [datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), self.robot_ns, cat, detail,
+               dist, f'{self.target_distance:.2f}', cam_age, self.mode, moved]
+        self.stop_events.append(row)
+        self.get_logger().warning(
+            f'[정지] {cat} | {detail} | 거리 {dist or "-"} m | 카메라 마지막 인식 {cam_age or "-"} 초 전 '
+            f'| 모드 {self.mode} | 주행 {moved} 초 후')
+        try:
+            new = not os.path.exists(self.stop_log_path)
+            with open(self.stop_log_path, 'a', newline='') as fp:
+                w = csv.writer(fp)
+                if new:
+                    w.writerow(['time', 'robot', 'cause', 'detail', 'lidar_distance_m',
+                                'target_distance_m', 'camera_last_seen_s', 'mode', 'moved_s'])
+                w.writerow(row)
+        except OSError as exc:
+            self.get_logger().error(f'stop log write failed: {exc}')
+
+    def print_stop_summary(self):
+        if not self.stop_events:
+            return
+        counts = {}
+        for r in self.stop_events:
+            counts[r[2]] = counts.get(r[2], 0) + 1
+        lines = [f'\n===== [{self.robot_ns}] 이번 실행 정지 원인 ({len(self.stop_events)}회) =====',
+                 '| 원인 | 횟수 |', '|---|---|']
+        lines += [f'| {k} | {v} |' for k, v in sorted(counts.items(), key=lambda kv: -kv[1])]
+        lines.append(f'전체 기록: {self.stop_log_path}  (표: ros2 run my_package stop_report)')
+        print('\n'.join(lines), flush=True)
+
+    # ================= 작업자 소실 복구 =================
+    def web_command_callback(self, msg: String):
+        try:
+            c = json.loads(msg.data)
+        except ValueError:
+            return
+        if isinstance(c, dict) and c.get('command') == 'pause' and c.get('value') is False:
+            self.clear_lost_pause('web/console resume')
+
+    def clear_lost_pause(self, why):
+        if self.lost_paused:
+            self.get_logger().info(f'Lost-worker pause cleared ({why})')
+        self.lost_paused = False
+
+    def current_yaw(self):
+        try:
+            return yaw_from_transform(
+                self.tf_buffer.lookup_transform(self.map_frame, self.base_frame, Time()))
+        except TransformException:
+            return None
+
+    def abort_recovery(self, why):
+        r, self.recover = self.recover, None
+        if r is None:
+            return
+        if r['stage'] == 'move':
+            self.want_goal = False
+            self.cancel_current_goal()
+        self.stop_rotation()
+        self.get_logger().info(f'Lost-worker search stopped ({why})')
+
+    def recovery_tick(self, now) -> bool:
+        """작업자를 lost_recovery_after 초 이상 못 봤을 때: 마지막 좌표로 이동 → 천천히 한 바퀴.
+        True 를 돌려주면 이번 주기 동작을 복구가 맡는다."""
+        if (not self.lost_recovery_enabled or self.last_worker_seen is None
+                or self.last_worker_map is None):
+            return False
+        r = self.recover
+        if r is None:
+            if (now - self.last_worker_seen < self.lost_recovery_after
+                    or self.recover_done_for == self.last_worker_seen):
+                return False
+            self.recover_done_for = self.last_worker_seen
+            r = self.recover = {'stage': 'move', 'start': now, 'sent': False}
+            x, y = self.last_worker_map
+            self.get_logger().warning(
+                f'Worker lost for {now - self.last_worker_seen:.1f}s -> moving to last position '
+                f'({x:.2f}, {y:.2f}), then one slow turn')
+        x, y = self.last_worker_map
+        if r['stage'] == 'move':
+            self.stop_cause = ('대상 소실 - 마지막 위치로 이동 중', f'({x:.2f}, {y:.2f})')
+            if not r['sent']:
+                if now - r['start'] > self.lost_move_timeout:
+                    r['stage'] = 'spin'
+                elif self.nav2_ready(now):
+                    try:
+                        t = self.tf_buffer.lookup_transform(self.map_frame, self.base_frame, Time())
+                        rx, ry = t.transform.translation.x, t.transform.translation.y
+                    except TransformException:
+                        rx, ry = x, y
+                    yaw = math.atan2(y - ry, x - rx) if math.hypot(x - rx, y - ry) > 0.05 else 0.0
+                    goal = PoseStamped()
+                    goal.header.frame_id = self.map_frame
+                    goal.header.stamp = self.get_clock().now().to_msg()
+                    goal.pose.position.x, goal.pose.position.y = x, y
+                    goal.pose.orientation.z = math.sin(yaw / 2.0)
+                    goal.pose.orientation.w = math.cos(yaw / 2.0)
+                    self.send_goal(goal, (x, y))
+                    r['sent'] = True
+                return True
+            if self.goal_request_pending or self.goal_active:
+                if now - r['start'] <= self.lost_move_timeout:
+                    return True
+                self.want_goal = False
+                self.cancel_current_goal()
+            self.get_logger().info('Lost-worker search: at last position -> slow 360 deg turn')
+            r.update(stage='spin', turned=0.0, last_yaw=None, spin_start=now)
+        # ---- spin ----
+        if r.get('spin_start') is None:
+            r.update(turned=0.0, last_yaw=None, spin_start=now)
+        if self.goal_active or self.goal_request_pending or self.cancel_pending:
+            return True                      # Nav2 와 동시에 회전 명령을 내지 않음
+        yaw = self.current_yaw()
+        if yaw is not None:
+            if r['last_yaw'] is not None:
+                r['turned'] += abs(wrap_angle(yaw - r['last_yaw']))
+            r['last_yaw'] = yaw
+        spin_limit = 2.0 * (2.0 * math.pi / max(self.lost_spin_speed, 0.05)) + 5.0
+        self.stop_cause = ('대상 소실 - 제자리 한 바퀴 탐색 중', f'{math.degrees(r["turned"]):.0f} deg')
+        if r['turned'] >= 2.0 * math.pi or now - r['spin_start'] > spin_limit:
+            self.stop_rotation()
+            self.recover = None
+            self.lost_paused = True
+            self.get_logger().warning(
+                f'Lost-worker search failed ({math.degrees(r["turned"]):.0f} deg turned) -> PAUSED. '
+                "Resume on web/console or confirm the worker again ('y').")
+            return False
+        self.publish_cmd(0.0, self.lost_spin_speed)
+        self.rotating = True
+        return True
+
     def control_loop(self):
         now = time.monotonic()
         if not self.startup_step(now):
+            self.stop_cause = ('시작 대기 (위치 인식/언독 전)', str(self.phase))
             self.stop_all()
             return
         if self.last_scan_received == 0.0:
@@ -799,8 +1020,11 @@ class WorkerFollower(Node):
                     or now - self.last_tf_success > self.tf_lost_timeout))
 
         reason = self.follow_allowed()
+        if reason is None and self.lost_paused:
+            reason = 'paused after lost-worker search (resume or y to continue)'
         if reason is not None:
-            pass
+            if self.recover is not None:
+                self.abort_recovery(f'blocked: {reason}')
         elif scan_lost:
             reason = 'scan timeout'
         elif cam_dead:
@@ -809,7 +1033,14 @@ class WorkerFollower(Node):
             reason = 'worker not seen by camera'
         elif tf_lost:
             reason = 'TF timeout'
+        if reason is None and self.recover is not None:
+            # 작업자를 다시 찾음 → 복구 중단, 아래 일반 추종 로직으로 이어감
+            self.get_logger().info('Lost-worker search: worker found again -> continue following')
+            self.abort_recovery('worker found')
+        if reason == 'worker not seen by camera' and self.recovery_tick(now):
+            return
         if reason is not None:
+            self.stop_cause = self.classify_block(reason, scan_lost, cam_dead, worker_lost, tf_lost)
             self.reset_association()
             if (self.goal_active or self.rotating) and now - self.last_lost_log > 2.0:
                 self.get_logger().warning(f'{reason}; stopping (smooth).')
@@ -822,12 +1053,15 @@ class WorkerFollower(Node):
 
         if target_lost:
             self.get_logger().warning('LiDAR lost the worker; re-associating from camera.')
+            self.stop_cause = ('대상 소실 - LiDAR', 'LiDAR 클러스터를 놓침 (카메라에는 보임)')
             self.reset_association()
 
         track = self.track
         if track is None:
             # Camera sees the worker but LiDAR has no match yet: do not drive,
             # but keep the worker centred by rotating in place.
+            if not self.stop_cause[0].startswith('대상 소실 - LiDAR'):
+                self.stop_cause = ('대상 소실 - LiDAR', '카메라 방향에 맞는 LiDAR 물체 없음')
             self.want_goal = False
             self.cancel_current_goal()
             self.mode = MODE_IDLE
@@ -835,6 +1069,14 @@ class WorkerFollower(Node):
             return
 
         self.update_mode(track['range'], track['moving'])
+        td = self.target_distance
+        if self.mode == MODE_HOLD:
+            self.stop_cause = ('가까워서 정지 - 목표 거리 도달', f'{track["range"]:.2f} m (목표 {td:.2f} m)')
+        elif self.mode == MODE_TOO_CLOSE:
+            self.stop_cause = ('가까워서 정지 - 너무 가까움', f'{track["range"]:.2f} m (목표 {td:.2f} m)')
+        else:
+            self.stop_cause = ('추종 중 멈춤 - Nav2 (경로 실패/장애물/재시도 대기)',
+                               f'{track["range"]:.2f} m, Nav2 실패 {self.nav_fail_count}회')
         if self.mode == MODE_APPROACH:
             self.stop_rotation()
             self.handle_approach(track, now, allow_new=True)
@@ -1020,7 +1262,8 @@ class WorkerFollower(Node):
         fresh = (self.last_target_seen is not None
                  and now - self.last_target_seen <= self.target_lost_timeout
                  and now - self.last_scan_received <= self.scan_lost_timeout)
-        if not (fresh and self.want_goal and seq == self.goal_seq):
+        recovering = self.recover is not None and self.recover.get('stage') == 'move'
+        if not ((fresh or recovering) and self.want_goal and seq == self.goal_seq):
             self.get_logger().warning('Late goal acceptance after stop; cancelling.')
             self.cancel_current_goal()
 
@@ -1066,6 +1309,165 @@ class WorkerFollower(Node):
             self.get_logger().warning(f'Cancel request failed: {exc}')
 
 
+# ================= 터틀봇 추종 (로봇 B 가 로봇 A 를 따라감) =================
+class RobotFollower(WorkerFollower):
+    """[터틀봇 추종] B로봇 호출로 A 앞에 도착한 로봇 B 가 로봇 A 를 따라간다.
+
+    - 인식: worker_detect tb 모드가 B 의 OAK-D 카메라로 A 를 찾아 /<B>/tb_detect/target 발행
+      (형식이 작업자 인식과 같아서 추종 로직(LiDAR 연결·Nav2·회전·소실 복구)은 WorkerFollower 그대로)
+    - 카메라: 호출을 받고 언독되면 바로 /<B>/robot_follow/active=True → tb 인식 시작 (가는 중에도 인식)
+    - 넘김: 가는 중 터틀봇이 3프레임 연속 인식되면 /<B>/robot_follow/found 발행
+            → web_relay 가 좌표 이동을 멈추고 호출을 성공 처리 (web_feedback ok)
+    - 켜짐: B 의 web_command 로 온 호출(navigate, purpose "call")의 결과가 web_feedback ok 로 오면
+            (가는 중 인식해서 넘겨받았거나, 끝까지 못 보고 A 앞에 도착했거나)
+    - 꺼짐: B 에 다른 이동·도킹·언독 명령 / B 의 user_register/cancel /
+            부른 로봇 A 의 user_register/cancel(작업 종료·인식 취소·구역 이동) 또는 A 의 dock 명령
+    - 가는 중이거나 추종 중일 때만 /<B>/robot_follow/active=True → tb 인식이 그동안만 카메라를 받음
+    """
+
+    # WorkerFollower 를 터틀봇 추종용 기본값으로 만들고 호출·카메라 관련 토픽을 추가한다.
+    def __init__(self, robot_ns: str):
+        ns = robot_ns.strip('/')
+        super().__init__(ns, node_prefix='robot_follow', param_defaults={
+            'worker_topic': f'/{ns}/tb_detect/target',          # tb 인식 결과
+            'debug_target_topic': f'/{ns}/robot_follow/target',
+            'require_web_confirm': True,                         # 호출 도착 전에는 추종 안 함
+            'target_distance': 0.8,                              # 로봇 A 와 유지할 거리 (m)
+            'camera_hfov_deg': 69.0,                             # OAK-D RGB (camera_info 오면 그 값으로)
+        })
+        self.caller = None           # 따라갈 로봇 A (호출한 로봇)
+        self.call_cmd_id = None      # 결과를 기다리는 호출 명령 id (= A 에게 가는 중)
+        self.tb_seen_count = 0       # 가는 중 터틀봇이 연속으로 인식된 프레임 수
+        self.hfov_logged = False
+        self.found_pub = self.create_publisher(Bool, f'/{ns}/robot_follow/found', 10)
+        self.stop_log_path = os.path.expanduser(f'~/follow_stop_log_{ns}_robot.csv')
+        self.create_subscription(String, f'/{ns}/web_feedback', self.own_feedback_callback, 10)
+        self.create_subscription(CameraInfo, f'/{ns}/oakd/rgb/camera_info',
+                                 self.camera_info_callback, qos_profile_sensor_data)
+        self.active_pub = self.create_publisher(Bool, f'/{ns}/robot_follow/active', 10)
+        self.create_timer(0.5, self.publish_active)
+        for r in ROBOTS.values():
+            other = r['name']
+            if other == ns:
+                continue
+            self.create_subscription(Bool, f'/{other}/user_register/cancel',
+                                     lambda m, o=other: self.caller_cancel_callback(o, m), 10)
+            self.create_subscription(String, f'/{other}/web_command',
+                                     lambda m, o=other: self.caller_command_callback(o, m), 10)
+        self.get_logger().info(f'Robot follow for {ns}: follows the calling robot after a call '
+                               f'arrives (input {self.worker_topic}, stop log {self.stop_log_path})')
+
+    # 사람 등록 응답(y/n)·재인식은 터틀봇 추종과 상관없으므로 무시.
+    def reply_callback(self, msg: String):
+        pass
+
+    # (위와 같음) 재인식 무시.
+    def retry_callback(self, msg: Bool):
+        pass
+
+    # 추종 가능하면 None, 아니면 이유 (호출 도착 전이면 그 이유로).
+    def follow_allowed(self) -> Optional[str]:
+        if not self.web_enabled:
+            return 'waiting for call arrival (robot follow off)'
+        return super().follow_allowed()
+
+    # 정지 원인 분류: 호출 도착 전 이유를 추가, 나머지는 작업자 추종과 같음.
+    @staticmethod
+    def classify_block(reason, scan_lost, cam_dead, worker_lost, tf_lost):
+        if reason.startswith('waiting for call arrival'):
+            return ('호출 도착 전 (터틀봇 추종 꺼짐)', reason)
+        return WorkerFollower.classify_block(reason, scan_lost, cam_dead, worker_lost, tf_lost)
+
+    # B 의 web_command: 호출이면 결과를 기다리고, 다른 이동·도킹·언독이면 터틀봇 추종을 끈다.
+    def web_command_callback(self, msg: String):
+        super().web_command_callback(msg)
+        try:
+            c = json.loads(msg.data)
+        except ValueError:
+            return
+        if not isinstance(c, dict) or c.get('robot') not in (None, self.robot_ns):
+            return
+        command = c.get('command')
+        if command == 'navigate' and c.get('purpose') == 'call':
+            self.call_cmd_id, self.caller = c.get('id'), c.get('caller')
+            if self.web_enabled:
+                self.set_web_enabled(False, f'new call from {self.caller}')
+            self.get_logger().info(f'Call from {self.caller} received; will follow it after arrival')
+        elif command in ('navigate', 'dock', 'undock'):
+            self.call_cmd_id = None
+            if self.web_enabled:
+                self.set_web_enabled(False, f'web {command} command')
+
+    # B 의 web_feedback: 기다리던 호출이 성공하면 터틀봇 추종 시작.
+    def own_feedback_callback(self, msg: String):
+        try:
+            f = json.loads(msg.data)
+        except ValueError:
+            return
+        if (not isinstance(f, dict) or self.call_cmd_id is None
+                or f.get('id') != self.call_cmd_id or f.get('command') != 'navigate'):
+            return
+        self.call_cmd_id = None
+        if f.get('ok'):
+            self.clear_lost_pause('call arrived')
+            self.set_web_enabled(True, f'arrived at {self.caller} -> following {self.caller}')
+        else:
+            self.get_logger().warning(f'Call from {self.caller} failed ({f.get("message")}); not following')
+
+    # 부른 로봇 A 의 user_register/cancel (작업 종료·인식 취소·구역 이동) → 터틀봇 추종 끔.
+    def caller_cancel_callback(self, other, msg: Bool):
+        if msg.data and other == self.caller and self.web_enabled:
+            self.set_web_enabled(False, f'{other} job end / recognition cancel / zone move')
+
+    # 부른 로봇 A 에 dock 명령 → 터틀봇 추종 끔.
+    def caller_command_callback(self, other, msg: String):
+        if other != self.caller or not self.web_enabled:
+            return
+        try:
+            c = json.loads(msg.data)
+        except ValueError:
+            return
+        if isinstance(c, dict) and c.get('command') == 'dock':
+            self.set_web_enabled(False, f'{other} is docking')
+
+    # OAK-D camera_info: 초점거리로 실제 가로 화각을 계산해 방향 계산에 사용.
+    def camera_info_callback(self, msg: CameraInfo):
+        fx, width = float(msg.k[0]), int(msg.width)
+        if fx <= 0.0 or width <= 0:
+            return
+        self.tan_half_hfov = (width / 2.0) / fx
+        if not self.hfov_logged:
+            self.hfov_logged = True
+            self.get_logger().info(f'OAK-D hfov from camera_info: '
+                                   f'{math.degrees(2.0 * math.atan(self.tan_half_hfov)):.1f} deg')
+
+    # 카메라(터틀봇 인식)가 켜져 있어야 하는지: 추종 중이거나, 호출로 가는 중이고 언독된 상태.
+    def camera_wanted(self) -> bool:
+        going = self.call_cmd_id is not None and self.is_docked is False
+        return bool(self.web_enabled or going)
+
+    # (0.5초) 카메라 켜짐 여부 발행 → worker_detect tb 모드가 그동안만 인식.
+    def publish_active(self):
+        self.active_pub.publish(Bool(data=self.camera_wanted()))
+
+    # tb 인식 결과: 원래 처리 + (A 에게 가는 중이면) 터틀봇이 FOUND_FRAMES 연속 인식되면
+    # /<B>/robot_follow/found 발행 → web_relay 가 좌표 이동을 멈추고 호출 성공 처리 → 추종 시작.
+    FOUND_FRAMES = 3
+
+    def worker_callback(self, msg):
+        super().worker_callback(msg)
+        if self.call_cmd_id is None or self.web_enabled:
+            self.tb_seen_count = 0
+            return
+        found = len(msg.data) >= 1 and msg.data[0] >= 0.5
+        self.tb_seen_count = self.tb_seen_count + 1 if found else 0
+        if self.tb_seen_count >= self.FOUND_FRAMES:
+            if self.tb_seen_count == self.FOUND_FRAMES:
+                self.get_logger().info(f'TurtleBot detected on the way to {self.caller} '
+                                       '-> asking web_relay to hand over to robot follow')
+            self.found_pub.publish(Bool(data=True))
+
+
 # ================= main =================
 def select_robots(argv) -> Optional[list]:
     """CLI argument (1/2/robot6/robot11/all) or terminal prompt -> list of robots."""
@@ -1103,7 +1505,14 @@ def select_robots(argv) -> Optional[list]:
 
 
 def main(args=None):
-    argv = sys.argv if args is None else args
+    argv = list(sys.argv if args is None else args)
+    # 첫 인자가 robot / tb 면 터틀봇 추종 모드 (나머지 인자는 로봇 선택 그대로)
+    user_args = remove_ros_args(args=argv)[1:]
+    robot_mode = bool(user_args) and user_args[0].lower() in ('robot', 'tb', 'turtlebot')
+    if robot_mode:
+        argv.pop(argv.index(user_args[0], 1))
+        print('>>> Robot follow mode: the called robot follows the calling robot (tb_detect)',
+              flush=True)
     robots = select_robots(argv)
     if not robots:
         return
@@ -1119,7 +1528,7 @@ def main(args=None):
     try:
         for r in robots:
             # 켜기만 해서는 언독하지 않음 (웹에서 로봇 선택 → web_relay 가 언독)
-            node = WorkerFollower(r['name'])
+            node = RobotFollower(r['name']) if robot_mode else WorkerFollower(r['name'])
             nodes.append(node)
             executor.add_node(node)
         executor.spin()
@@ -1128,6 +1537,7 @@ def main(args=None):
     finally:
         for node in nodes:
             try:
+                node.print_stop_summary()
                 node.cancel_undock()
                 node.stop_rotation()
                 node.cancel_current_goal()

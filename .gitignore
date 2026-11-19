@@ -12,4 +12,6 @@
 !/my_package/worker_detect_node.py
 !/my_package/worker_follow_node.py
 !/my_package/web_relay_node.py
+!/my_package/terminal_console.py
+!/my_package/stop_report.py
 __pycache__/

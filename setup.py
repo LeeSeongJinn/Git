@@ -39,6 +39,8 @@ setup(
             'worker_follow= my_package.worker_follow_node:main',
             'worker_detect= my_package.worker_detect_node:main',
             'web_relay= my_package.web_relay_node:main',
+            'console= my_package.terminal_console:main',   # 웹 대신 터미널 테스트
+            'stop_report= my_package.stop_report:main',    # 추종 정지 원인 표
 
         ],
     },

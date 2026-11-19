@@ -20,6 +20,14 @@
       drive    : stop 이 오거나 0.5초 동안 drive 가 없으면 정지하고 해제
       navigate / dock : 끝나면(성공·실패·취소) 해제 (도킹된 뒤에는 worker_follow 가 스스로 멈춤)
   - undock(웹에서 로봇 선택): dock_status 확인 → 도킹이면 언독, 이미 언독이면 건너뜀
+  - B로봇 호출(navigate, purpose "call", caller "robot6"): 호출된 로봇의 web_command 로 옴
+      1) 호출된 로봇이 도킹이면 언독 먼저 (이미 언독이면 건너뜀)
+      2) 부른 로봇(추종 중인 로봇)의 좌표 = 관제 PC 가 받은 최신 amcl_pose (없으면 명령의 x, y)
+      3) 부른 로봇 앞 call_stop_distance 지점으로 이동 (부른 로봇을 바라봄)
+         가는 동안 부른 로봇이 call_update_distance 이상 움직이면 목표를 다시 보냄
+         가는 중 카메라에 터틀봇이 잡히면({ns}/robot_follow/found) 이동을 멈추고 성공 처리
+         → worker_follow robot 모드가 그때부터 터틀봇 추종
+      4) 도착/인식/실패 시 web_feedback (command "navigate")
   - user_register/* 토픽은 웹 서버 ↔ 객체탐지 PC 가 직접 주고받으므로 중계하지 않음
 
 실행
@@ -50,6 +58,33 @@ from std_msgs.msg import Bool, String
 
 FEEDBACK_COMMANDS = ('navigate', 'dock', 'undock')
 
+# 구역 / 도킹 대기 지점 좌표 (map 기준 x, y, yaw rad) — 관제 PC(web_relay)가 기준
+#   웹(스마트폰·관제 모니터) 서버는 구역 이름('A')·'dock' 만 보내므로 여기서 좌표를 채운다.
+#   (final_map 에서 도크로부터 도달 가능·벽과 0.4 m 이상 확인, 2026-11-19)
+ZONE_POSES = {
+    'A': (-0.83, -0.90, 0.0),
+    'B': (-2.93, 0.0, 0.0),
+    'C': (-4.6, 0.6, 0.0),
+}
+DOCK_WAYPOINTS = {            # 웹 robot1 = robot6, robot2 = robot11
+    'robot6': (-0.33, 1.23, 0.1),
+    'robot11': (-0.45, -0.49, 0.13),
+}
+
+
+def fill_coordinates(robot, c):
+    """구역 이동·도킹 명령의 좌표를 관제 PC 표로 채운다 (보낸 쪽 좌표보다 우선)."""
+    command = c.get('command')
+    if command == 'navigate' and c.get('purpose') == 'zone':
+        zone = str(c.get('zone', '')).upper()
+        if zone not in ZONE_POSES:
+            raise ValueError(f'unknown zone "{c.get("zone")}" (known: {sorted(ZONE_POSES)})')
+        c['x'], c['y'], c['yaw'] = ZONE_POSES[zone]
+    elif command == 'dock':
+        if robot not in DOCK_WAYPOINTS:
+            raise ValueError(f'no dock waypoint for {robot}')
+        c['x'], c['y'], c['yaw'] = DOCK_WAYPOINTS[robot]
+
 
 def yaw_from_quat(q) -> float:
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
@@ -73,6 +108,7 @@ class RobotLink:
         # 상태
         self.battery = None
         self.pose = None              # (x, y, yaw)
+        self.pose_time = 0.0          # amcl_pose 마지막 수신 (monotonic)
         self.is_docked = None
         self.last_robot_msg = 0.0     # 로봇 토픽 마지막 수신 (연결 판단)
         self.ping_ms = None
@@ -102,6 +138,10 @@ class RobotLink:
         self.pub_status = n.create_publisher(String, f('web_status'), 10)
         self.pub_cmd = n.create_publisher(TwistStamped, f('cmd_vel'), 10)
         self.pub_pause = n.create_publisher(Bool, f('pause'), 10)
+        # 구역 이동·도킹 때 추종을 끊기 위한 등록 취소 (worker_follow·worker_detect 가 구독)
+        self.pub_register_cancel = n.create_publisher(Bool, f('user_register/cancel'), 10)
+        # 호출로 가는 중 터틀봇(부른 로봇)이 카메라에 잡힘 (worker_follow robot 모드가 발행)
+        n.create_subscription(Bool, f('robot_follow/found'), self.on_robot_found, 10)
         self.nav_client = ActionClient(n, NavigateToPose, f('navigate_to_pose'))
         self.dock_client = ActionClient(n, Dock, f('dock'))
         self.undock_client = ActionClient(n, Undock, f('undock'))
@@ -120,7 +160,7 @@ class RobotLink:
     def on_pose(self, m: PoseWithCovarianceStamped):
         p = m.pose.pose
         self.pose = (p.position.x, p.position.y, yaw_from_quat(p.orientation))
-        self.last_robot_msg = time.monotonic()
+        self.pose_time = self.last_robot_msg = time.monotonic()
 
     def on_dock_status(self, m: DockStatus):
         self.is_docked = bool(m.is_docked)
@@ -209,9 +249,12 @@ class RobotLink:
                 'pause': self.cmd_pause, 'navigate': self.cmd_navigate,
                 'dock': self.cmd_dock, 'undock': self.cmd_undock,
             }.get(command)
+            if command == 'navigate' and c.get('purpose') == 'call':
+                handler = self.cmd_call          # B로봇 호출: 언독 → 부른 로봇 위치로
             if handler is None:
                 self.log.error(f'[{self.name}] unknown command "{command}"')
                 return
+            fill_coordinates(self.name, c)
             handler(c)
         except Exception as exc:  # 명령 하나가 실패해도 노드는 계속
             self.log.error(f'[{self.name}] command {command} failed: {exc}')
@@ -341,24 +384,51 @@ class RobotLink:
 
         client.send_goal_async(goal).add_done_callback(on_goal)
 
+    FOLLOW_HANDOFF_SEC = 0.6   # 추종 중이었으면 이 시간 뒤에 이동 시작 (추종 노드의 마지막 goal 이 덮어쓰지 않게)
+
+    def cut_following(self, c):
+        """구역 이동·도킹: 추종을 끊는다 (도착 후에도 다시 사람에게 돌아가지 않게 등록 취소)."""
+        if c.get('command') == 'dock' or c.get('purpose') == 'zone':
+            self.pub_register_cancel.publish(Bool(data=True))
+            self.log.info(f'[{self.name}] following cut (register cancel) for {c.get("command")} '
+                          f'{c.get("zone", "")}')
+
+    def start_after_handoff(self, task, was_following, start):
+        """추종 중이었으면 pause 가 먼저 적용되도록 잠깐 기다린 뒤 이동 시작."""
+        if not was_following:
+            start()
+            return
+        holder = {}
+
+        def fire():
+            holder['t'].cancel()
+            if self.task_alive(task):
+                start()
+        holder['t'] = self.node.create_timer(self.FOLLOW_HANDOFF_SEC, fire)
+
     def cmd_navigate(self, c):
         goal = self.make_nav_goal(c)
+        was_following = not self.follow_blocked()
         task = self.start_task(c)
         self.nav_active = True
-        self.stop_motion()                # drive 중이었으면 정지, 추종 정지
+        self.stop_motion()                # drive 중이었으면 정지, 추종 정지 (pause 발행)
+        self.cut_following(c)
         what = (f'zone {c.get("zone")}' if c.get('purpose') == 'zone'
                 else f'call from {c.get("caller")}' if c.get('purpose') == 'call' else 'goal')
         self.log.info(f'[{self.name}] navigate ({what}) -> '
-                      f'({c["x"]:.2f}, {c["y"]:.2f}, yaw {float(c.get("yaw", 0.0)):.2f})')
-        self.send_action(task, self.nav_client, goal, 'navigate',
-                         lambda ok, m: self.finish_task(task, ok, m))
+                      f'({c["x"]:.2f}, {c["y"]:.2f}, yaw {float(c.get("yaw", 0.0)):.2f})'
+                      + (' (was following: stop first)' if was_following else ''))
+        self.start_after_handoff(task, was_following, lambda: self.send_action(
+            task, self.nav_client, goal, 'navigate', lambda ok, m: self.finish_task(task, ok, m)))
 
     # ---------- dock ----------
     def cmd_dock(self, c):
         goal = self.make_nav_goal(c)
+        was_following = not self.follow_blocked()
         task = self.start_task(c)
         self.nav_active = True
         self.stop_motion()
+        self.cut_following(c)
 
         def after_nav(ok, message):
             if not ok:
@@ -370,8 +440,10 @@ class RobotLink:
             self.send_action(task, self.dock_client, Dock.Goal(), 'dock',
                              lambda ok2, m2: self.finish_task(task, ok2, m2))
 
-        self.log.info(f'[{self.name}] dock: waypoint ({c["x"]:.2f}, {c["y"]:.2f}) then dock')
-        self.send_action(task, self.nav_client, goal, 'navigate to dock waypoint', after_nav)
+        self.log.info(f'[{self.name}] dock: waypoint ({c["x"]:.2f}, {c["y"]:.2f}) then dock'
+                      + (' (was following: stop first)' if was_following else ''))
+        self.start_after_handoff(task, was_following, lambda: self.send_action(
+            task, self.nav_client, goal, 'navigate to dock waypoint', after_nav))
 
     # ---------- undock ----------
     def cmd_undock(self, c):
@@ -427,6 +499,150 @@ class RobotLink:
 
         self.undock_client.send_goal_async(Undock.Goal()).add_done_callback(on_goal)
 
+    # ---------- call (B로봇 호출) ----------
+    def call_later(self, sec, fn):
+        """sec 초 뒤 fn() 한 번 실행."""
+        holder = []
+
+        def fire():
+            holder[0].cancel()
+            self.node.destroy_timer(holder[0])
+            fn()
+        holder.append(self.node.create_timer(sec, fire))
+
+    def caller_position(self, c):
+        """부른 로봇 위치 (x, y, 출처): 관제 PC 가 받은 최신 amcl_pose 우선, 없으면 명령의 x, y."""
+        link = self.node.link_by_name(c.get('caller'))
+        if link is not None and link.pose is not None:
+            return link.pose[0], link.pose[1], 'live amcl_pose'
+        if finite(c.get('x'), c.get('y')):
+            return float(c['x']), float(c['y']), 'command x/y'
+        return None
+
+    def make_call_goal(self, cx, cy):
+        """부른 로봇 앞 call_stop_distance 지점 (부른 로봇을 바라봄). 이미 그 안이면 None."""
+        d = self.node.call_stop_distance
+        if self.pose is not None:
+            rx, ry = self.pose[0], self.pose[1]
+        else:                                    # 내 위치를 아직 모름: 보통 도크에 있으므로 도킹 지점 기준
+            rx, ry = DOCK_WAYPOINTS.get(self.name, (cx - d - 1.0, cy, 0.0))[:2]
+        dx, dy = cx - rx, cy - ry
+        dist = math.hypot(dx, dy)
+        if dist <= d + 0.05:
+            return None
+        gx, gy = cx - dx / dist * d, cy - dy / dist * d
+        return self.make_nav_goal({'x': gx, 'y': gy, 'yaw': math.atan2(dy, dx)})
+
+    def cmd_call(self, c):
+        caller = c.get('caller')
+        if caller == self.name:
+            raise ValueError('caller is this robot')
+        if self.caller_position(c) is None:
+            raise ValueError(f'no position for caller "{caller}"')
+        was_following = not self.follow_blocked()
+        task = self.start_task(c)
+        task['caller'] = caller
+        task['call'] = True                 # 가는 중 터틀봇을 인식하면 추종으로 넘김 (on_robot_found)
+        self.nav_active = True               # 이동하는 동안 이 로봇의 추종은 멈춤
+        self.stop_motion()
+        self.log.info(f'[{self.name}] call from {caller}: '
+                      f'{"undock first, then " if self.is_docked else ""}go to {caller}')
+        deadline = time.monotonic() + self.node.dock_status_wait
+        self.start_after_handoff(task, was_following, lambda: self.ensure_undocked(
+            task, deadline, lambda: self.go_to_caller(task, c)))
+
+    def ensure_undocked(self, task, deadline, then):
+        """도킹이면 언독 후 then(), 이미 언독이면 바로 then(), 도킹 여부를 모르면 기다림."""
+        if not self.task_alive(task):
+            return
+        if self.is_docked is None:
+            if time.monotonic() < deadline:
+                self.call_later(0.2, lambda: self.ensure_undocked(task, deadline, then))
+                return
+            self.finish_task(task, False, f'no dock status on {self.ns}/dock_status; call aborted')
+            return
+        if self.is_docked is False:
+            then()
+            return
+        self.log.info(f'[{self.name}] call: docked -> undocking first')
+
+        def after_undock(ok, message):
+            if not ok:
+                self.finish_task(task, False, f'call: {message}')
+                return
+            self.log.info(f'[{self.name}] call: undocked -> going to caller')
+            then()
+        self.send_action(task, self.undock_client, Undock.Goal(), 'undock', after_undock)
+
+    def go_to_caller(self, task, c):
+        if not self.task_alive(task):
+            return
+        pos = self.caller_position(c)
+        if pos is None:
+            self.finish_task(task, False, f'no position for caller "{c.get("caller")}"')
+            return
+        goal = self.make_call_goal(pos[0], pos[1])
+        if goal is None:
+            self.finish_task(task, True, f'already near {c.get("caller")}')
+            return
+        self.send_call_goal(task, c, goal, pos)
+        task['timer'] = self.node.create_timer(self.node.call_update_period,
+                                               lambda: self.update_call_goal(task, c))
+
+    def send_call_goal(self, task, c, goal, pos):
+        task['nav_seq'] = seq = task.get('nav_seq', 0) + 1
+        task['target'] = (pos[0], pos[1])
+        p = goal.pose.pose.position
+        self.log.info(f'[{self.name}] call: goal ({p.x:.2f}, {p.y:.2f}) near {c.get("caller")} '
+                      f'at ({pos[0]:.2f}, {pos[1]:.2f}) [{pos[2]}]')
+
+        def done(ok, message):
+            if task.get('nav_seq') != seq:
+                return                       # 새 목표로 대체된 이전 goal 의 결과
+            self.stop_call_timer(task)
+            self.finish_task(task, ok, f'call from {c.get("caller")}: {message}')
+        self.send_action(task, self.nav_client, goal, 'navigate to caller', done)
+
+    def update_call_goal(self, task, c):
+        """가는 동안 부른 로봇이 움직였으면 목표 갱신."""
+        if not self.task_alive(task):
+            self.stop_call_timer(task)
+            return
+        pos = self.caller_position(c)
+        if pos is None or 'target' not in task:
+            return
+        tx, ty = task['target']
+        moved = math.hypot(pos[0] - tx, pos[1] - ty)
+        if moved < self.node.call_update_distance:
+            return
+        goal = self.make_call_goal(pos[0], pos[1])
+        if goal is None:
+            return                           # 이미 충분히 가까움: 지금 goal 이 끝나게 둠
+        self.log.info(f'[{self.name}] call: {c.get("caller")} moved {moved:.2f} m -> update goal')
+        self.send_call_goal(task, c, goal, pos)
+
+    def on_robot_found(self, msg: Bool):
+        """호출로 가는 중 카메라에 터틀봇이 잡힘 → 좌표 이동을 멈추고 호출 성공 처리 (→ 터틀봇 추종 시작)."""
+        task = self.task
+        if not msg.data or task is None or not task.get('call'):
+            return
+        self.log.info(f'[{self.name}] call: TurtleBot detected on the way -> stop going, hand over to robot follow')
+        self.stop_call_timer(task)
+        gh = self.goal_handle
+        if gh is not None:
+            try:
+                gh.cancel_goal_async()
+            except Exception as exc:
+                self.log.warning(f'[{self.name}] cancel failed: {exc}')
+        self.finish_task(task, True, f'call from {task.get("caller", "?")}: '
+                                     'TurtleBot detected on the way -> robot follow')
+
+    def stop_call_timer(self, task):
+        t = task.pop('timer', None)
+        if t is not None:
+            t.cancel()
+            self.node.destroy_timer(t)
+
     def shutdown(self):
         if self.driving:
             self.publish_cmd(0.0, 0.0)
@@ -444,12 +660,18 @@ class WebRelay(Node):
         dp('max_linear', 0.2)
         dp('max_angular', 0.8)
         dp('dock_status_wait', 3.0)            # undock 명령 때 도킹 여부를 모르면 기다리는 시간
+        dp('call_stop_distance', 0.8)          # 호출: 부른 로봇에서 이 거리 앞에 멈춤 (m)
+        dp('call_update_distance', 0.5)        # 호출: 부른 로봇이 이만큼 움직이면 목표 갱신 (m)
+        dp('call_update_period', 2.0)          # 호출: 목표 갱신 확인 주기 (초)
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.connected_timeout = float(g('connected_timeout'))
         self.drive_timeout = float(g('drive_timeout'))
         self.max_linear = abs(float(g('max_linear')))
         self.max_angular = abs(float(g('max_angular')))
         self.dock_status_wait = float(g('dock_status_wait'))
+        self.call_stop_distance = abs(float(g('call_stop_distance')))
+        self.call_update_distance = abs(float(g('call_update_distance')))
+        self.call_update_period = max(0.2, float(g('call_update_period')))
 
         names = [str(r).strip('/') for r in g('robots') if str(r).strip('/')]
         ips = list(g('robot_ips'))
@@ -458,6 +680,12 @@ class WebRelay(Node):
         self.create_timer(float(g('status_period')), self.publish_status)
         self.create_timer(0.1, self.tick)
         self.get_logger().info(f'web relay started for {names}')
+
+    def link_by_name(self, name):
+        for link in self.links:
+            if link.name == name:
+                return link
+        return None
 
     def publish_status(self):
         for link in self.links:
